@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: porownywarka
+    env: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm install && npx puppeteer browsers install chrome
+    startCommand: node server.js
+    envVars:
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/project/src/.cache/puppeteer

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Porównywarka cen skanerów</title>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 30px auto;
+           max-width: 1050px; padding: 0 20px; background: #f8fafc; color: #1e293b; }
+    h1 { font-size: 26px; margin-bottom: 6px; }
+    p.lead { color: #64748b; margin-top: 0; }
+    .card { background: #fff; padding: 24px; border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,.1); margin-bottom: 20px; }
+    .controls { display: flex; gap: 12px; margin-top: 15px; flex-wrap: wrap; }
+    button { background: #2563eb; color: #fff; border: none; padding: 10px 18px;
+             border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 14px; }
+    button:disabled { background: #94a3b8; cursor: not-allowed; }
+    button.export { background: #16a34a; }
+    button.stop { background: #64748b; }
+    #status { margin-top: 15px; font-weight: 500; }
+    #mapping { margin-top: 10px; font-size: 13px; color: #64748b; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; background: #fff;
+            border-radius: 8px; overflow: hidden; }
+    th, td { border: 1px solid #e2e8f0; padding: 10px; text-align: left; font-size: 14px;
+             vertical-align: top; }
+    th { background: #f1f5f9; }
+    a { color: #2563eb; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .not-found { color: #dc2626; font-weight: 600; }
+    .skipped { color: #b45309; font-size: 12px; }
+    .price { font-weight: 600; white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+  <h1>Porównywarka cen skanerów</h1>
+  <p class="lead">Wgraj arkusz z listą modeli. Kolumny rozpoznawane są po nagłówkach.</p>
+
+  <div class="card">
+    <input type="file" id="excelFile" accept=".xlsx, .xls, .csv" />
+    <div class="controls">
+      <button id="btnStart" disabled>Rozpocznij szukanie</button>
+      <button id="btnStop" class="stop" style="display:none">Przerwij</button>
+      <button id="btnExport" class="export" style="display:none">Pobierz wynikowy Excel</button>
+    </div>
+    <div id="status">Wybierz plik Excel…</div>
+    <div id="mapping"></div>
+  </div>
+
+  <table id="resultsTable" style="display:none">
+    <thead>
+      <tr>
+        <th>Nazwa</th>
+        <th>Model</th>
+        <th>EAN</th>
+        <th>Cena</th>
+        <th>Źródło</th>
+        <th>Link</th>
+      </tr>
+    </thead>
+    <tbody id="resultsBody"></tbody>
+  </table>
+
+  <script>
+    // Lokalnie backend słucha na 8788, po wdrożeniu serwuje tę stronę spod
+    // własnego adresu — dzięki temu jeden plik działa w obu miejscach.
+    const API = ['localhost', '127.0.0.1'].includes(location.hostname)
+      ? 'http://localhost:8788'
+      : location.origin;
+
+    const fileInput  = document.getElementById('excelFile');
+    const btnStart   = document.getElementById('btnStart');
+    const btnStop    = document.getElementById('btnStop');
+    const btnExport  = document.getElementById('btnExport');
+    const statusDiv  = document.getElementById('status');
+    const mappingDiv = document.getElementById('mapping');
+    const tableBody  = document.getElementById('resultsBody');
+    const table      = document.getElementById('resultsTable');
+
+    let parsedItems = [];
+    let completedResults = [];
+    let aborted = false;
+
+    fileInput.addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = evt => {
+        const workbook = XLSX.read(new Uint8Array(evt.target.result), { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+        parsedItems = [];
+
+        // Kolumny czytamy po nagłówkach, a nie po pozycji — arkusze bywają
+        // układane różnie i sztywne indeksy wysyłały do backendu śmieci.
+        const header = (rows[0] || []).map(h => String(h).toLowerCase().trim());
+        const find = re => header.findIndex(h => re.test(h));
+
+        const cEan   = find(/ean|gtin/);
+        const cModel = find(/model\s*no|^model$|kod|symbol/);
+        const cName  = find(/model\s*name|modelname|nazwa|^name$/);
+
+        mappingDiv.innerText =
+          'Rozpoznane kolumny — ' +
+          `nazwa: ${cName >= 0 ? header[cName] : 'brak'}, ` +
+          `model: ${cModel >= 0 ? header[cModel] : 'brak'}, ` +
+          `EAN: ${cEan >= 0 ? header[cEan] : 'brak'}`;
+
+        for (let i = 1; i < rows.length; i++) {
+          const r = rows[i];
+          if (!r || !r.length) continue;
+
+          const cell = c => c >= 0 ? String(r[c] || '').trim() : '';
+          const rawEan = cell(cEan);
+
+          // 4,71349E+12 to Excel, który skrócił liczbę — brakuje w niej cyfr,
+          // więc lepiej pominąć EAN niż szukać po zmyślonym numerze.
+          const truncated = /\d[.,]?\d*\s*[eE]\s*[+-]?\s*\d+/.test(rawEan);
+          const digits = truncated ? '' : rawEan.replace(/\D/g, '');
+
+          const model = cell(cModel);
+          const name  = cell(cName);
+          if (!digits && !model && !name) continue;
+
+          parsedItems.push({
+            name,
+            model,
+            ean: digits.length >= 8 && digits.length <= 14 ? digits : ''
+          });
+        }
+
+        statusDiv.innerText = `Wczytano ${parsedItems.length} pozycji.`;
+        btnStart.disabled = parsedItems.length === 0;
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+    btnStop.addEventListener('click', () => {
+      aborted = true;
+      btnStop.disabled = true;
+      statusDiv.innerText = 'Przerywam po bieżącej pozycji…';
+    });
+
+    btnStart.addEventListener('click', async () => {
+      aborted = false;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      btnStop.style.display = 'inline-block';
+      fileInput.disabled = true;
+      btnExport.style.display = 'none';
+      table.style.display = 'table';
+      tableBody.innerHTML = '';
+      completedResults = [];
+
+      for (let i = 0; i < parsedItems.length; i++) {
+        if (aborted) break;
+        const item = parsedItems[i];
+        statusDiv.innerText =
+          `[${i + 1}/${parsedItems.length}] Sprawdzam: ${item.name || item.model || item.ean}…`;
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${item.name || '-'}</td>
+          <td>${item.model || '-'}</td>
+          <td>${item.ean || '-'}</td>
+          <td id="price-${i}">szukanie…</td>
+          <td id="src-${i}">-</td>
+          <td id="link-${i}">-</td>`;
+        tableBody.appendChild(tr);
+
+        const params = new URLSearchParams();
+        if (item.ean)   params.append('ean', item.ean);
+        if (item.name)  params.append('name', item.name);
+        if (item.model) params.append('model', item.model);
+
+        const priceCell = document.getElementById(`price-${i}`);
+        const srcCell   = document.getElementById(`src-${i}`);
+        const linkCell  = document.getElementById(`link-${i}`);
+
+        try {
+          const res = await fetch(`${API}/check?${params.toString()}`);
+          const data = await res.json();
+
+          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          const c = data.result || data.ceneo || {};
+
+          if (c.price) {
+            priceCell.innerHTML = `<span class="price">${c.price} zł</span>`;
+            srcCell.innerText = c.source || '-';
+            linkCell.innerHTML = c.url
+              ? `<a href="${c.url}" target="_blank" rel="noopener">otwórz ofertę</a>` : '-';
+          } else {
+            priceCell.innerHTML = '<span class="not-found">brak ofert</span>';
+            // Backend zwraca tu powód pominięcia źródła, np. zakaz w robots.txt
+            srcCell.innerHTML = (c.skipped && c.skipped.length)
+              ? `<span class="skipped">${c.skipped.join('<br>')}</span>` : '-';
+          }
+
+          completedResults.push({
+            'Nazwa': item.name,
+            'Model': item.model,
+            'EAN': item.ean,
+            'Cena': c.price || '',
+            'Źródło': c.source || '',
+            'Link': c.url || ''
+          });
+        } catch (err) {
+          priceCell.innerHTML = `<span class="not-found">błąd</span>`;
+          srcCell.innerHTML = `<span class="skipped">${err.message}</span>`;
+          completedResults.push({
+            'Nazwa': item.name, 'Model': item.model, 'EAN': item.ean,
+            'Cena': '', 'Źródło': 'błąd: ' + err.message, 'Link': ''
+          });
+        }
+      }
+
+      statusDiv.innerText = aborted
+        ? `Przerwano. Sprawdzono ${completedResults.length} pozycji.`
+        : 'Gotowe — zakończono sprawdzanie.';
+      btnExport.style.display = 'inline-block';
+      btnStop.style.display = 'none';
+      btnStart.disabled = false;
+      fileInput.disabled = false;
+    });
+
+    btnExport.addEventListener('click', () => {
+      const ws = XLSX.utils.json_to_sheet(completedResults);
+      ws['!cols'] = [{ wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 10 }, { wch: 26 }, { wch: 50 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Wyniki');
+      XLSX.writeFile(wb, 'wyniki_cen.xlsx');
+    });
+  </script>
+</body>
+</html>
